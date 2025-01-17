@@ -1,72 +1,156 @@
-import os
-import sys
-from pathlib import Path
-from typing import Any, Dict, Optional, Tuple
+from types import MappingProxyType
+from typing import Any
 
 
-class TrieNode:
-    def __init__(self, config_file: str = "", config_data: Optional[Dict[str, Any]] = None) -> None:
-        if not config_data:
-            config_data = {}
+def _get_scrapy_item_classes() -> tuple:
+    try:
+        import scrapy
+    except ImportError:
+        return ()
+    else:
+        try:
+            _base_item_cls = getattr(scrapy.item, "_BaseItem", scrapy.item.BaseItem)  # deprecated
+            return (scrapy.item.Item, _base_item_cls)
+        except AttributeError:
+            return (scrapy.item.Item,)
 
-        self.nodes: Dict[str, TrieNode] = {}
-        self.config_info: Tuple[str, Dict[str, Any]] = (config_file, config_data)
+
+def _is_dataclass(obj: Any) -> bool:
+    try:
+        import dataclasses
+    except ImportError:
+        return False
+    return dataclasses.is_dataclass(obj)
 
 
-class Trie:
+def _is_attrs_class(obj: Any) -> bool:
+    try:
+        import attr
+    except ImportError:
+        return False
+    return attr.has(obj)
+
+
+def _is_pydantic_model(obj: Any) -> bool:
+    try:
+        from pydantic import BaseModel
+    except ImportError:
+        return False
+    return issubclass(obj, BaseModel)
+
+
+def _get_pydantic_model_metadata(item_model: Any, field_name: str) -> MappingProxyType:
+    metadata = {}
+    field = item_model.__fields__[field_name].field_info
+
+    for attr in [
+        "alias",
+        "title",
+        "description",
+        "const",
+        "gt",
+        "ge",
+        "lt",
+        "le",
+        "multiple_of",
+        "min_items",
+        "max_items",
+        "min_length",
+        "max_length",
+        "regex",
+    ]:
+        value = getattr(field, attr)
+        if value is not None:
+            metadata[attr] = value
+    if not field.allow_mutation:
+        metadata["allow_mutation"] = field.allow_mutation
+    metadata.update(field.extra)
+
+    return MappingProxyType(metadata)
+
+
+def is_dataclass_instance(obj: Any) -> bool:
+    """Return True if the given object is a dataclass object, False otherwise.
+
+    In py36, this function returns False if the "dataclasses" backport is not available.
+
+    Taken from https://docs.python.org/3/library/dataclasses.html#dataclasses.is_dataclass.
     """
-    A prefix tree to store the paths of all config files and to search the nearest config
-    associated with each file
+    return _is_dataclass(obj) and not isinstance(obj, type)
+
+
+def is_pydantic_instance(obj: Any) -> bool:
+    """Return True if the given object is a Pydantic model, False otherwise."""
+    return _is_pydantic_model(type(obj)) and not isinstance(obj, type)
+
+
+def is_attrs_instance(obj: Any) -> bool:
+    """Return True if the given object is a attrs-based object, False otherwise."""
+    return _is_attrs_class(obj) and not isinstance(obj, type)
+
+
+def is_scrapy_item(obj: Any) -> bool:
+    """Return True if the given object is a Scrapy item, False otherwise."""
+    try:
+        import scrapy
+    except ImportError:
+        return False
+    if isinstance(obj, scrapy.item.Item):
+        return True
+    try:
+        # handle deprecated BaseItem
+        BaseItem = getattr(scrapy.item, "_BaseItem", scrapy.item.BaseItem)
+        return isinstance(obj, BaseItem)
+    except AttributeError:
+        return False
+
+
+def is_item(obj: Any) -> bool:
+    """Return True if the given object belongs to one of the supported types, False otherwise.
+
+    Alias for ItemAdapter.is_item
     """
+    from itemadapter.adapter import ItemAdapter
 
-    def __init__(self, config_file: str = "", config_data: Optional[Dict[str, Any]] = None) -> None:
-        self.root: TrieNode = TrieNode(config_file, config_data)
-
-    def insert(self, config_file: str, config_data: Dict[str, Any]) -> None:
-        resolved_config_path_as_tuple = Path(config_file).parent.resolve().parts
-
-        temp = self.root
-
-        for path in resolved_config_path_as_tuple:
-            if path not in temp.nodes:
-                temp.nodes[path] = TrieNode()
-
-            temp = temp.nodes[path]
-
-        temp.config_info = (config_file, config_data)
-
-    def search(self, filename: str) -> Tuple[str, Dict[str, Any]]:
-        """
-        Returns the closest config relative to filename by doing a depth
-        first search on the prefix tree.
-        """
-        resolved_file_path_as_tuple = Path(filename).resolve().parts
-
-        temp = self.root
-
-        last_stored_config: Tuple[str, Dict[str, Any]] = ("", {})
-
-        for path in resolved_file_path_as_tuple:
-            if temp.config_info[0]:
-                last_stored_config = temp.config_info
-
-            if path not in temp.nodes:
-                break
-
-            temp = temp.nodes[path]
-
-        return last_stored_config
+    return ItemAdapter.is_item(obj)
 
 
-def exists_case_sensitive(path: str) -> bool:
-    """Returns if the given path exists and also matches the case on Windows.
+def get_field_meta_from_class(item_class: type, field_name: str) -> MappingProxyType:
+    """Return a read-only mapping with metadata for the given field name, within the given item class.
+    If there is no metadata for the field, or the item class does not support field metadata,
+    an empty object is returned.
 
-    When finding files that can be imported, it is important for the cases to match because while
-    file os.path.exists("module.py") and os.path.exists("MODULE.py") both return True on Windows,
-    Python can only import using the case of the real file.
+    Field metadata is taken from different sources, depending on the item type:
+    * scrapy.item.Item: corresponding scrapy.item.Field object
+    * dataclass items: "metadata" attribute for the corresponding field
+    * attrs items: "metadata" attribute for the corresponding field
+    * pydantic models: corresponding pydantic.field.FieldInfo/ModelField object
+
+    The returned value is an instance of types.MappingProxyType, i.e. a dynamic read-only view
+    of the original mapping, which gets automatically updated if the original mapping changes.
     """
-    result = os.path.exists(path)
-    if (sys.platform.startswith("win") or sys.platform == "darwin") and result:  # pragma: no cover
-        directory, basename = os.path.split(path)
-        result = basename in os.listdir(directory)
-    return result
+    if issubclass(item_class, _get_scrapy_item_classes()):
+        return MappingProxyType(item_class.fields[field_name])  # type: ignore
+    elif _is_dataclass(item_class):
+        from dataclasses import fields
+
+        for field in fields(item_class):
+            if field.name == field_name:
+                return field.metadata  # type: ignore
+        raise KeyError("%s does not support field: %s" % (item_class.__name__, field_name))
+    elif _is_attrs_class(item_class):
+        from attr import fields_dict
+
+        try:
+            return fields_dict(item_class)[field_name].metadata  # type: ignore
+        except KeyError:
+            raise KeyError("%s does not support field: %s" % (item_class.__name__, field_name))
+    elif _is_pydantic_model(item_class):
+        try:
+            return _get_pydantic_model_metadata(item_class, field_name)
+        except KeyError:
+            raise KeyError("%s does not support field: %s" % (item_class.__name__, field_name))
+    elif issubclass(item_class, dict):
+        return MappingProxyType({})
+    else:
+        raise TypeError("%s is not a valid item class" % (item_class,))
